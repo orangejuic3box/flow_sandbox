@@ -24,7 +24,7 @@ from IPython.display import HTML, display
 
 
 # ======================================================================================
-# 1. SOURCES: (rng, sample_size, center, half_width) -> (N,) int64, centered on `center`
+# SOURCES: (rng, sample_size, center, half_width) -> (N,) int64, centered on `center`
 # ======================================================================================
 def symmetric_samples(rng, sample_size, center=20, half_width=3):
     """
@@ -66,10 +66,10 @@ SOURCES = {
 
 
 # ======================================================================================
-# 2. PROCESSES: (rng, source, steps, **kwargs) -> (steps + 1, N) trajectory
-#    row 0 is the source, the last row is the target
+# PROCESSES: (rng, source, steps, **kwargs) -> (steps + 1, N) trajectory
+# 0 is the source, the last row is the target
 # ======================================================================================
-def apply_poisson_process(rng, source, steps, lam=3.5, dt=1.0):
+def apply_poisson_process(rng, source, steps, lam=0.3, dt=1.0):
     """Each step adds Poisson(lam * dt) new events to every sample."""
     increments = rng.poisson(lam * dt, size=(steps, len(source)))
     counts_over_time = source + np.cumsum(increments, axis=0)
@@ -90,15 +90,15 @@ PROCESSES = {
 
 
 # ======================================================================================
-# 3. MEASURES: one source distribution + the process that turns it into its target
+# DISCRETE MEASURE DISTRIBUTION: one source distribution + the process that turns it into its target
 # ======================================================================================
 @dataclass
-class MeasureSpec:
+class DiscreteMeasure:
     center: int = 20
     sample_type: str = "symmetric"
     process_type: str = "poisson"
-    timesteps: int = 9
-    half_width: int = 3
+    timesteps: int = 100
+    half_width: int = 3 #the range of the dsitribution will be ~2*half_width
     process_kwargs: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -108,24 +108,27 @@ class MeasureSpec:
 
     @property
     def name(self):
+        """
+        The name of the measure is SAMPLE_TYPE_CENTER_LOCATION_PROCESS 
+        """
         extra = "_".join(f"{k}{v}" for k, v in self.process_kwargs.items())
         return f"{self.sample_type}_c{self.center}_{self.process_type}" + (f"_{extra}" if extra else "")
 
 
-TaskSpec = MeasureSpec   # old name, kept so earlier code still works
-
-
-def generate_task(spec, sample_size, rng):
-    """Full trajectory for one measure: (timesteps + 1, sample_size) int64."""
+def generate_target_dist(spec, sample_size, rng):
+    """
+    First creates the source distributoin then applies the discrete process to each measure: (timesteps + 1, sample_size) int64.
+    """
     source = SOURCES[spec.sample_type](rng, sample_size, center=spec.center, half_width=spec.half_width)
     return PROCESSES[spec.process_type](rng, source, spec.timesteps, **spec.process_kwargs)
 
 
 def make_measure_specs(n_measures=None, centers=None, min_center=4, max_center=50, seed=None, **spec_kwargs):
     """
-    Build one MeasureSpec per source center. Either pass `centers` explicitly, or pass
-    `n_measures` to draw that many distinct centers from [min_center, max_center).
-    Any other MeasureSpec argument (process_type, timesteps, process_kwargs, ...) applies to all.
+    Creates one DiscreteMeasure object per source center. 
+    Source centers are either a list of given centers, or n_measures number of centers will generated between the min and max value.
+
+    Any other DiscreteMeasure argument (process_type, timesteps, process_kwargs, ...) applies to all.
     """
     if centers is None:
         assert n_measures is not None, "pass either n_measures or centers"
@@ -134,19 +137,19 @@ def make_measure_specs(n_measures=None, centers=None, min_center=4, max_center=5
         centers = np.sort(rng.choice(np.arange(min_center, max_center), size=n_measures, replace=False))
 
     #make the data
-    return [MeasureSpec(center=int(c), **spec_kwargs) for c in centers]
+    return [DiscreteMeasure(center=int(c), **spec_kwargs) for c in centers]
 
 
 # ======================================================================================
-# 4. DATASET + DATALOADER
+# DATASET + DATALOADER
 # ======================================================================================
 class MeasureDataset(Dataset):
     """
     Unpaired source/target data for one or more measures.
 
-    (1) For every measure, a pool of `pool_size` source samples is generated and the process
+    (1) For every measure, a pool of `batch_size` source samples is generated and the process
         is applied to get a pool of target samples:
-            source pool [N_measures, pool_size, D],  target pool [N_measures, pool_size, D]
+            source pool [N_measures, batch_size, D],  target pool [N_measures, batch_size, D]
     (2) Each item is ONE measure: `n_samples` drawn from its source pool and, independently,
         `n_samples` from its target pool, so no source sample is linked to a target sample.
 
@@ -155,28 +158,28 @@ class MeasureDataset(Dataset):
     With batch_size = N_measures, one batch holds every measure: [N_measures, n_samples, D].
     """
 
-    def __init__(self, specs, n_samples=256, pool_size=10_000, seed=None, replace=False):
-        specs = [s if isinstance(s, MeasureSpec) else MeasureSpec(**s) for s in specs]
+    def __init__(self, specs, n_samples=256, batch_size=10_000, seed=None, replace=False):
+        specs = [s if isinstance(s, DiscreteMeasure) else DiscreteMeasure(**s) for s in specs]
         assert len(specs) > 0, "need at least one measure"
-        assert replace or n_samples <= pool_size, "n_samples > pool_size needs replace=True"
+        assert replace or n_samples <= batch_size, "n_samples > batch_size needs replace=True"
         self.specs = specs
         self.n_samples = n_samples
-        self.pool_size = pool_size
+        self.batch_size = batch_size
         self.replace = replace
         self.rng = np.random.default_rng(seed)
         self.resample()
 
     def resample(self):
         """(Re)generate every measure's source and target pools."""
-        # [N_measures, T + 1, pool_size]: the full process, kept for plotting
-        self.trajectories = np.stack([generate_task(s, self.pool_size, self.rng) for s in self.specs])
+        # [N_measures, T + 1, batch_size]: the full process, kept for plotting
+        self.trajectories = np.stack([generate_target_dist(s, self.batch_size, self.rng) for s in self.specs])
         self.source = torch.as_tensor(self.trajectories[:, 0], dtype=torch.long).unsqueeze(-1)   # [M, P, 1]
         self.target = torch.as_tensor(self.trajectories[:, -1], dtype=torch.long).unsqueeze(-1)  # [M, P, 1]
 
     def _draw(self, n):
         if self.replace:
-            return torch.randint(self.pool_size, (n,))
-        return torch.randperm(self.pool_size)[:n]
+            return torch.randint(self.batch_size, (n,))
+        return torch.randperm(self.batch_size)[:n]
 
     def __len__(self):
         return self.n_measures
@@ -201,9 +204,11 @@ class MeasureDataset(Dataset):
         return x0, x1
 
     @property
+    # how many source/measures we have
     def n_measures(self):
         return len(self.specs)
 
+    #@@@ is this needed??
     def value_range(self):
         """Smallest and largest count across every source and target pool."""
         return int(min(self.source.min(), self.target.min())), int(max(self.source.max(), self.target.max()))
@@ -212,17 +217,22 @@ class MeasureDataset(Dataset):
         """A V covering every count from 0 up, with headroom for fresh resamples."""
         _, hi = self.value_range()
         return int(np.ceil((hi + 1) * (1 + margin)))
+    #@@@ is this needed??
 
-    def plot_measure(self, m, n_snapshots=2, x_max=None):
+
+    #@@@ is this needed??
+    def plot_measures(self, m, n_snapshots=2, x_max=None):
+        """ plots a specific measure at index m """
         spec = self.specs[m]
         plot_dpd(self.trajectories[m], sample_type=spec.sample_type,
                  process_type=spec.process_type, n_snapshots=n_snapshots,
                  x_max=x_max, center=spec.center)
+    #@@@ is this needed??
 
     def __repr__(self):
         lines = [f"{m}: {s.name}" for m, s in enumerate(self.specs)]
         return (f"MeasureDataset({self.n_measures} measures, {self.n_samples} samples each, "
-                f"pool {self.pool_size})\n  " + "\n  ".join(lines))
+                f"batch {self.batch_size})\n  " + "\n  ".join(lines))
 
 
 def make_dataloader(dataset, batch_size=None, shuffle=True, drop_last=False, **kwargs):
@@ -255,19 +265,21 @@ def create_dpd(sample_size=50,
     sample_size: number of datapoints in each distribution
     """
     rng = np.random.default_rng(seed)
-    spec = TaskSpec(center=center, 
-                    sample_type=sample_type, 
-                    process_type=process_type,
-                    timesteps=timesteps, 
-                    process_kwargs=process_kwargs)
-    processed = generate_task(spec, sample_size, rng)
+    spec = DiscreteMeasure(center=center, 
+                           sample_type=sample_type, 
+                           process_type=process_type,
+                           timesteps=timesteps, 
+                           process_kwargs=process_kwargs)
+    
+    processed = generate_target_dist(spec, sample_size, rng)
+    
     if plotting:
-        plot_dpd(processed, sample_type=sample_type, process_type=process_type, center=center)
+        plot_dpd(processed, sample_type=sample_type, process_type=process_type)
     return processed
 
 
 # ======================================================================================
-# 6. PLOTTING
+# PLOTTING
 # ======================================================================================
 def calculate_bins(samples):
     """Bin centers and relative frequencies, with bins centered on integers."""
@@ -278,22 +290,28 @@ def calculate_bins(samples):
 
 
 def plot_dpd(processed, sample_type="symmetric", process_type="poisson", n_snapshots=2,
-             x_max=None, center=None):
+             x_max=102, center=None):
     T = len(processed)
     colors = plt.cm.managua(np.linspace(0, 1, T))
 
     # evenly spaced time steps, always including t = 0 and t = 1
     idxs = np.linspace(0, T - 1, n_snapshots).round().astype(int).tolist()
 
-    fig, axes = plt.subplots(n_snapshots, 1, figsize=(6.5, 4.2 * n_snapshots), layout="constrained")
+    fig, axes = plt.subplots(n_snapshots, 1, figsize=(6.5, 4.2 * n_snapshots), layout="constrained", sharey=True)
     axes = np.atleast_1d(axes)
 
-    if x_max is None:
-        x_max = int(np.max(processed)) + 2
+
 
     for ax, i in zip(axes, idxs):
         bin_centers, counts = calculate_bins(processed[i])
+        #plot bars
         ax.bar(bin_centers, counts, width=0.9, color=colors[i], edgecolor="navy", linewidth=0.3, alpha=0.7)
+
+        # mark where the initial source distribution was centered
+        if center is not None:
+            ax.axvline(center, color="crimson", linestyle="--", linewidth=1.0, label=f"source center ({center})")
+            ax.legend(loc="upper right", fontsize=8)
+
         ax.set_title(f"t = {i / (T - 1):.2f}")
         ax.set_xlim(-1, x_max)
         ax.set_xlabel("Number of Events ($k$)", fontsize=12)
@@ -308,9 +326,9 @@ def plot_dpd(processed, sample_type="symmetric", process_type="poisson", n_snaps
 
 
 def animate_discrete_histograms(traj, V, epoch=None, offset=0, target=None,
-                                max_frames=60, interval=100, x_max=None,
+                                max_frames=60, interval=100, x_max=102,
                                 title_prefix="Discrete FM", save_gif=False,
-                                filename=None):
+                                filename=None, center=None):
     """
     Animate how a 1D count distribution changes over time.
 
@@ -348,20 +366,30 @@ def animate_discrete_histograms(traj, V, epoch=None, offset=0, target=None,
         ax.legend(loc="upper right", fontsize=8)
         y_top = max(y_top, t_freq.max())
 
+    # mark where the initial source distribution was centered (static: stays put every frame)
+    if center is not None:
+        ax.axvline(center, color="crimson", linestyle="--", linewidth=1.0, label=f"source center ({center})")
+
+    if target is not None or center is not None:
+        ax.legend(loc="upper right", fontsize=8)
+
     ax.set_ylim(0, 1.1 * y_top)
     ax.set_xlim(x[0] - 1, x_max if x_max is not None else x[-1] + 1)
     ax.set_xlabel("Number of Events ($k$)", fontsize=12)
     ax.set_ylabel("Relative Frequency", fontsize=12)
     ax.grid(axis="y", linestyle="--", alpha=0.5)
 
+    fig.suptitle(title_prefix,
+                 fontsize=14, fontweight="bold")
+
     epoch_text = f" Epoch {epoch}" if epoch is not None else ""
-    title = ax.set_title(f"{title_prefix}{epoch_text} ($t = 0.00$)")
+    title = ax.set_title(f"{epoch_text} ($t = 0.00$)")
 
     def update(i):
         for bar, h in zip(bars, freqs[i]):
             bar.set_height(h)
             bar.set_facecolor(colors[i])
-        title.set_text(f"{title_prefix}{epoch_text} ($t = {i / (T - 1):.2f}$)")
+        title.set_text(f"{epoch_text} ($t = {i / (T - 1):.2f}$)")
         return (*bars, title)
 
     anim = FuncAnimation(fig, update, frames=frames, interval=interval, blit=False)
