@@ -159,7 +159,7 @@ def plot_dpd(processed, sample_type=SAMPLE_TYPE, process_type=PROCESS_TYPE, n_sn
     # plot figs horizontal
     # fig, axes = plt.subplots(1, n_snapshots, figsize=(6.5 * n_snapshots, 4.2), layout="constrained")
     # plot figs vertical
-    fig, axes = plt.subplots(n_snapshots, 1, figsize=(6.5, 4.2 * n_snapshots), layout="constrained")
+    fig, axes = plt.subplots(n_snapshots, 1, figsize=(6.5, 4.2 * n_snapshots), layout="constrained", sharey=True)
 
 
     x_max = 102
