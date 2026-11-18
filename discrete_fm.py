@@ -185,6 +185,7 @@ class DiscreteFlowMatching:
                             center=spec.center, 
                             title_prefix=f"{spec.process_type.upper()} Process applied to a {spec.sample_type.upper()} Distribution (center {spec.center})"
                         )
+    
 
 
             
