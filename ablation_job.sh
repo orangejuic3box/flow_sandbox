@@ -3,7 +3,7 @@
 # Submit from ~/flow_toybox with:   mkdir -p logs && sbatch ablation_job.sh
 #
 #SBATCH --job-name=ablate-measures
-#SBATCH --account=aip-CHANGEME          # your allocation: on vulcan, `ls ~/projects` lists it
+#SBATCH --account=aip-lazar          # your allocation: on vulcan, `ls ~/projects` lists it
 #SBATCH --array=0-17                    # must equal len(N_LIST) * len(SEEDS) - 1  (6 * 3 - 1)
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=4
