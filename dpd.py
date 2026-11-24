@@ -123,18 +123,23 @@ def generate_target_dist(spec, sample_size, rng):
     return PROCESSES[spec.process_type](rng, source, spec.timesteps, **spec.process_kwargs)
 
 
-def make_measure_specs(n_measures=None, centers=None, min_center=4, max_center=50, seed=None, **spec_kwargs):
+def make_measure_specs(n_measures=None, centers=None, min_center=4, max_center=29, seed=None, **spec_kwargs):
     """
     Creates one DiscreteMeasure object per source center. 
     Source centers are either a list of given centers, or n_measures number of centers will generated between the min and max value.
 
     Any other DiscreteMeasure argument (process_type, timesteps, process_kwargs, ...) applies to all.
+
+    train centers are between [4, 29]
+    ]
+    test centers are between [30, 50]
     """
     if centers is None:
         assert n_measures is not None, "pass either n_measures or centers"
         # a list of centers were not passed, so draw n_measures centers randomly
         rng = np.random.default_rng(seed)
-        centers = np.sort(rng.choice(np.arange(min_center, max_center), size=n_measures, replace=False))
+        #add +1 to max bc np.arrange doesn't include endpoint
+        centers = np.sort(rng.choice(np.arange(min_center, max_center+1), size=n_measures, replace=False))
 
     #make the data
     return [DiscreteMeasure(center=int(c), **spec_kwargs) for c in centers]
@@ -147,39 +152,35 @@ class MeasureDataset(Dataset):
     """
     Unpaired source/target data for one or more measures.
 
-    (1) For every measure, a pool of `batch_size` source samples is generated and the process
+    (1) For every measure, a pool of `dataloader batch_size` source samples is generated and the process
         is applied to get a pool of target samples:
-            source pool [N_measures, batch_size, D],  target pool [N_measures, batch_size, D]
+            source pool [N_measures, pool_size, D],  target pool [N_measures, pool_size, D]
     (2) Each item is ONE measure: `n_samples` drawn from its source pool and, independently,
         `n_samples` from its target pool, so no source sample is linked to a target sample.
 
     Item:  {"x0": [n_samples, D], "x1": [n_samples, D], "measure": ()}
     Batch: {"x0": [B, n_samples, D], "x1": [B, n_samples, D], "measure": [B]}
-    With batch_size = N_measures, one batch holds every measure: [N_measures, n_samples, D].
+    Dataloader batchsize = N_measures, one batch holds every measure: [N_measures, n_samples, D].
     """
 
-    def __init__(self, specs, n_samples=256, batch_size=10_000, seed=None, replace=False):
+    def __init__(self, specs, n_samples=256, pool_size=10_000, seed=None):
         specs = [s if isinstance(s, DiscreteMeasure) else DiscreteMeasure(**s) for s in specs]
         assert len(specs) > 0, "need at least one measure"
-        assert replace or n_samples <= batch_size, "n_samples > batch_size needs replace=True"
         self.specs = specs
         self.n_samples = n_samples
-        self.batch_size = batch_size
-        self.replace = replace
+        self.pool_size = pool_size
         self.rng = np.random.default_rng(seed)
         self.resample()
 
     def resample(self):
         """(Re)generate every measure's source and target pools."""
-        # [N_measures, T + 1, batch_size]: the full process, kept for plotting
-        self.trajectories = np.stack([generate_target_dist(s, self.batch_size, self.rng) for s in self.specs])
+        # [N_measures, T + 1, pool_size]: the full process, kept for plotting
+        self.trajectories = np.stack([generate_target_dist(s, self.pool_size, self.rng) for s in self.specs])
         self.source = torch.as_tensor(self.trajectories[:, 0], dtype=torch.long).unsqueeze(-1)   # [M, P, 1]
         self.target = torch.as_tensor(self.trajectories[:, -1], dtype=torch.long).unsqueeze(-1)  # [M, P, 1]
 
     def _draw(self, n):
-        if self.replace:
-            return torch.randint(self.batch_size, (n,))
-        return torch.randperm(self.batch_size)[:n]
+        return torch.randperm(self.pool_size)[:n]
 
     def __len__(self):
         return self.n_measures
@@ -191,22 +192,40 @@ class MeasureDataset(Dataset):
             "x1": self.target[m, self._draw(self.n_samples)],
             "measure": torch.tensor(m, dtype=torch.long),
         }
+    
+    def to(self, device):
+        # put the dataset on gpu's (aka the device)
+        self.source, self.target = self.source.to(device), self.target.to(device)
+        return self
 
     def sample(self, measures=None, n_samples=None):
         """
         Draw directly, without a DataLoader (handy for sampling and evaluation).
         Returns x0, x1 of shape [len(measures), n_samples, D].
         """
-        measures = range(self.n_measures) if measures is None else measures
+        # measures = range(self.n_measures) if measures is None else measures
+        # n = self.n_samples if n_samples is None else n_samples
+        # x0 = torch.stack([self.source[m, self._draw(n)] for m in measures])
+        # x1 = torch.stack([self.target[m, self._draw(n)] for m in measures])
+        # # return x0, x1
+
+        #number of points in that measure
         n = self.n_samples if n_samples is None else n_samples
-        x0 = torch.stack([self.source[m, self._draw(n)] for m in measures])
-        x1 = torch.stack([self.target[m, self._draw(n)] for m in measures])
-        return x0, x1
+        #measure
+        m = torch.arange(self.n_measures) if measures is None else torch.as_tensor(measures)
+        m = m.to(self.source.device)[:, None]
+        #index
+        idx = lambda: torch.randint(self.pool_size, (len(m), n), device=self.source.device)
+        return self.source[m, idx()], self.target[m, idx()]
 
     @property
     # how many source/measures we have
     def n_measures(self):
         return len(self.specs)
+
+    @property
+    def centers(self):
+        return [spec.center for spec in self.specs]
 
     #@@@ is this needed??
     def value_range(self):
@@ -232,9 +251,10 @@ class MeasureDataset(Dataset):
     def __repr__(self):
         lines = [f"{m}: {s.name}" for m, s in enumerate(self.specs)]
         return (f"MeasureDataset({self.n_measures} measures, {self.n_samples} samples each, "
-                f"batch {self.batch_size})\n  " + "\n  ".join(lines))
+                f"pool {self.pool_size})\n  " + "\n  ".join(lines))
 
-
+# ======================================================================================
+# ======================================================================================
 def make_dataloader(dataset, batch_size=None, shuffle=True, drop_last=False, **kwargs):
     """batch_size defaults to every measure at once: batches of [N_measures, n_samples, D]."""
     if batch_size is None:
@@ -399,4 +419,95 @@ def animate_discrete_histograms(traj, V, epoch=None, offset=0, target=None,
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         anim.save(filename, writer="pillow", fps=18)
     display(HTML(anim.to_jshtml()))
+    plt.close(fig)
+
+
+def animate_measures_grid(traj, targets, specs, V, epoch=None, ncols=5, pad=3,
+                          max_frames=60, interval=100, save_gif=False, filename=None, display_anim=True):
+    """
+    Animate every measure at once: one subplot per measure, all stepping through t = 0 -> 1 together.
+
+    traj:     [T, M, N] integer tokens, e.g. torch.stack(dfm.sample(return_trajectory=True)).squeeze(-1)
+    targets:  [M, N] target samples, e.g. dfm.dpd_target[..., 0]
+    specs:    list of M DiscreteMeasure, used for titles and the center line
+    V:        number of bins
+    pad:      bins of margin around the data when zooming each subplot
+    """
+    #return nothing if save_gif and display_anim are both false
+    if not (save_gif or display_anim):
+        return
+
+    traj = torch.as_tensor(traj).cpu().numpy().astype(int)
+    targets = torch.as_tensor(targets).cpu().numpy().astype(int)
+    assert traj.ndim == 3, f"expected traj of shape (T, M, N), got {traj.shape}"
+    T, M, N = traj.shape
+    assert targets.shape[0] == len(specs) == M, \
+        f"expected {M} measures, got targets {targets.shape[0]} and specs {len(specs)}"
+
+    def rel_freq(tokens):
+        return np.bincount(tokens.clip(0, V - 1), minlength=V)[:V] / len(tokens)
+
+    # (T, M, V) histograms for every frame and measure
+    freqs = np.stack([[rel_freq(traj[k, m]) for m in range(M)] for k in range(T)])
+    colors = plt.cm.managua(np.linspace(0, 1, T))
+    frames = np.unique(np.linspace(0, T - 1, min(max_frames, T)).round().astype(int))
+
+    ncols = min(ncols, M)
+    nrows = int(np.ceil(M / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.6 * ncols, 2.8 * nrows),
+                             layout="constrained", squeeze=False)
+
+    all_bars = []
+    for m, (ax, spec) in enumerate(zip(axes.flat, specs)):
+        # zoom each subplot to where its data lives over the whole trajectory;
+        # only draw bars inside that window (keeps the animation fast with many measures)
+        lo = max(int(min(traj[:, m].min(), targets[m].min())) - pad, 0)
+        hi = min(int(max(traj[:, m].max(), targets[m].max())) + pad, V - 1)
+        x = np.arange(lo, hi + 1)
+
+        bars = ax.bar(x, freqs[0, m, lo:hi + 1], width=0.9, color=colors[0],
+                      edgecolor="navy", linewidth=0.3, alpha=0.7)
+        all_bars.append((bars, lo, hi))
+
+        t_freq = rel_freq(targets[m])
+        ax.step(x, t_freq[lo:hi + 1], where="mid", color="steelblue", linewidth=1.2, label="Target")
+        ax.step(x, freqs[0, m, lo:hi + 1], where="mid", color="gold", linewidth=1.2, label="Source")
+        ax.axvline(spec.center, color="crimson", linestyle="--", linewidth=0.8, label="Source center")
+
+        ax.set_xlim(lo - 1, hi + 1)
+        ax.set_ylim(0, 1.1 * max(freqs[:, m].max(), t_freq.max()))
+        ax.set_title(f"center {spec.center}", fontsize=10)
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+    for ax in axes.flat[M:]:  # hide unused cells in the last row
+        ax.set_visible(False)
+
+    axes.flat[0].legend(loc="upper right", fontsize=7)
+    fig.supxlabel("Number of Events ($k$)")
+    fig.supylabel("Relative Frequency")
+    epoch_text = f"Epoch {epoch}, " if epoch is not None else ""
+    title = fig.suptitle(f"{specs[0].process_type.upper()} process, {M} measures — {epoch_text}$t = 0.00$",
+                         fontsize=13, fontweight="bold")
+
+    def update(i):
+        artists = []
+        for m, (bars, lo, hi) in enumerate(all_bars):
+            for bar, h in zip(bars, freqs[i, m, lo:hi + 1]):
+                bar.set_height(h)
+                bar.set_facecolor(colors[i])
+            artists.extend(bars)
+        title.set_text(f"{specs[0].process_type.upper()} process, {M} measures — "
+                       f"{epoch_text}$t = {i / (T - 1):.2f}$")
+        return (*artists, title)
+
+    anim = FuncAnimation(fig, update, frames=frames, interval=interval, blit=False)
+    if save_gif:
+        if filename is None:
+            filename = f"gifs/discrete_flow_matching/measures{M}/measures{M}_grid_epoch{epoch}.gif"
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        anim.save(filename, writer="pillow", fps=18)
+
+    if display_anim:
+        display(HTML(anim.to_jshtml()))
+    
     plt.close(fig)
