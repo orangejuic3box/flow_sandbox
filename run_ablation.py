@@ -44,7 +44,7 @@ def main():
     p.add_argument("--n", type=int, required=True, help="number of training measures")
     p.add_argument("--world_seed", type=int, required=True, help="torch seed: init, batches, t draws, sampling")
     p.add_argument("--train_seed", type=int, default=10, help="which centers are picked + the training pools")
-    p.add_argument("--test_seed", type=int, default=1010, help="the test pools")
+    p.add_argument("--test_seed", type=int, default=1010, help="the test seed")
     p.add_argument("--epochs", type=int, default=20000)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--eval_n", type=int, default=1024)
@@ -60,12 +60,15 @@ def main():
     # data: numpy generators, seeded by train_seed / test_seed (don't touch the torch RNG)
     spec_test = make_measure_specs(centers=TEST_CENTERS)
     dpd_test = MeasureDataset(spec_test, seed=args.test_seed)
+    
     spec_train = make_measure_specs(n_measures=args.n, seed=args.train_seed)
     dpd_train = MeasureDataset(spec_train, seed=args.train_seed)
+    
     print(dpd_train, flush=True)
 
     # everything torch-random from here on is fixed by world_seed
     set_seed(args.world_seed)
+
     model = DiscreteAttentionFlow(
         D=DIM,
         out_dim=DIM * V,
@@ -81,14 +84,18 @@ def main():
 
     dfm = DiscreteFlowMatching(optimizer, device, model, V, "dpd", dataset=dpd_train)
     start = time.time()
+    #training
     dfm.train(epochs=args.epochs, batch_size=args.batch_size, save_gif=args.save_gif, display_anim=False)
     train_minutes = (time.time() - start) / 60
-    print(f"training took {train_minutes:.1f} min", flush=True)
+    print(f"training {args.n} measures took {train_minutes:.1f} min", flush=True)
 
     results = dfm.evaluate(dpd_test, N=args.eval_n)
     for r in results:
-        r.update(world_seed=args.world_seed, train_seed=args.train_seed, test_seed=args.test_seed,
-                 epochs=args.epochs, train_minutes=round(train_minutes, 2))
+        r.update(world_seed=args.world_seed, 
+                train_seed=args.train_seed, 
+                test_seed=args.test_seed,
+                epochs=args.epochs, 
+                train_minutes=round(train_minutes, 2))
 
     out_path = os.path.join(args.out_dir, f"world_seed{args.world_seed}",
                             f"n{args.n}_trainseed{args.train_seed}_testseed{args.test_seed}.csv")
