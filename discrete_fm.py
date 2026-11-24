@@ -9,9 +9,11 @@ import torch.nn.functional as F
 from data import sample_cats, sample_moons, discretize, undiscretize
 # from discrete_process_data import create_dpd, plot_dpd, animate_discrete_histograms
 
-from dpd import make_dataloader, infinite_batches, animate_discrete_histograms
+from dpd import animate_discrete_histograms, animate_measures_grid #make_dataloader, infinite_batches,
 
 from utils import plot_discrete_trajectories, animate_discrete_trajectories
+
+from loss import *
 
 
 class DiscreteFlowMatching:
@@ -33,6 +35,7 @@ class DiscreteFlowMatching:
             _, hi = dataset.value_range()
             assert hi < V, f"largest count {hi} doesn't fit in V={V}; try V={dataset.suggest_V()}"
             self.dataset = dataset
+            self.dataset.to(device)
             self.dpd_target = None
 
     def preprocess_data(self, data):
@@ -60,8 +63,11 @@ class DiscreteFlowMatching:
 
         
 
-    def sample_source(self, batch_size):
+    def sample_source(self, batch_size, dataset=None):
         '''
+        batch_size is the number of points to sample
+        dataset should be None during training, during tests, the testset is draw from
+        
         Returns the data in shape (N,D) (number of points, dimension size)
         '''
         if self.data_type == "catmoons":
@@ -85,7 +91,7 @@ class DiscreteFlowMatching:
             return self.dpd_target        
 
 
-    def train(self, epochs=5000, batch_size = 256):
+    def train(self, epochs=5000, batch_size = 256, save_gif=True, display_anim=True):
         #define training parameters
         self.model.train()
 
@@ -97,14 +103,10 @@ class DiscreteFlowMatching:
             #generate & format data according to dataset type
             #should be a torch tensor of shape (N,D)
             x0 = (self.preprocess_data(self.sample_source(batch_size))
-                .clone()
-                .detach()
                 .to(device=self.device) 
             )
             
             x1 = (self.preprocess_data(self.sample_target(batch_size))
-                  .clone()
-                  .detach()
                   .to(device=self.device)
             )
 
@@ -155,7 +157,7 @@ class DiscreteFlowMatching:
             self.optimizer.step()
 
             
-            if k % max(1, epochs // 10) == 0 or k == (epochs-1): #in [0,50, 250,500, 1000, 1999]:
+            if k % max(1, epochs // 5) == 0 or k == (epochs-1): #in [0,50, 250,500, 1000, 1999]:
                 end = time.time()
                 print(f"Epoch:{k}: loss {loss.item():0.3f} time {(end - start):0.2f}")
                 start = end
@@ -172,26 +174,22 @@ class DiscreteFlowMatching:
                     plot_discrete_trajectories(traj, V=self.v)
                     animate_discrete_trajectories(traj, V=self.v, epoch=k, save_gif=True)
                 elif self.data_type == "dpd":
-                    traj = traj.squeeze(-1) #drop D dimension (==1)
+                    traj = traj.squeeze(-1) #drop D dimension (==1); [T, M, N]
 
-                    for m, spec in enumerate(self.dataset.specs):
-                        # plot_dpd(traj, n_snapshots = 3)
-
-                        animate_discrete_histograms(
-                            traj[:, m], 
-                            V=self.v, 
-                            epoch=k,
-                            target=self.dpd_target[m, :, 0].cpu(),
-                            center=spec.center, 
-                            title_prefix=f"{spec.process_type.upper()} Process applied to a {spec.sample_type.upper()} Distribution (center {spec.center})"
-                        )
+                    # every measure animated together, one subplot each
+                    animate_measures_grid(
+                        traj,
+                        targets=self.dpd_target[..., 0],
+                        specs=self.dataset.specs,
+                        V=self.v,
+                        epoch=k,
+                        save_gif=save_gif,
+                        display_anim=display_anim
+                    )
     
 
-
-            
-
     @torch.no_grad()
-    def sample(self, N=1500, total_steps=99, return_trajectory=False):
+    def sample(self, N=1500, total_steps=99, return_trajectory=False, source=None):
         '''
         Simulates the discrete flow of starting with t0 and xt as x0,
         it jumps towards its predicted x1 in total_steps, 
@@ -203,7 +201,8 @@ class DiscreteFlowMatching:
         # xt = discretize(self.sample_source(N), V=self.v).to(self.device)
         xt = (self.preprocess_data(self.sample_source(N))
             .to(device=self.device) 
-        )
+        ) if source is None else source
+
         M = xt.shape[0] if self.data_type == "dpd" else None
         
         traj = [xt.clone()]
@@ -240,5 +239,48 @@ class DiscreteFlowMatching:
  
         return traj if return_trajectory else xt
 
+    @torch.no_grad()
+    def evaluate(self, testset, N=1024):
+        '''
+        Runs the testset of measures through the model and compare
+        the generated samples to that measure's target with W1 and energy distance.
 
-    
+        The floor is how far apart two samples of the true target usually are, on average. If the model scores about the same, its generated samples are as close to the target as another real draw of the target would be.
+
+        We want the metrics between generated and test to be close to as test and test2
+
+        Returns a list to be converted to PDFrame
+        '''
+        #check testset to fit in V bins
+        _, hi = testset.value_range()
+        assert hi < self.v, f"largest test count {hi} doesn't fit in V={self.v}"
+
+        #put testset on gpu and eval mode
+        testset.to(self.device)
+        self.model.eval()
+
+        #sample testset
+        test_source, test_target = testset.sample(n_samples=N)
+        #generate target using test source
+        generated_target = self.sample(N=N, return_trajectory=False, source=test_source)
+
+        #put model back on train mode
+        self.model.train()
+
+        #calculate wssertein 1 and energy distance
+        as_float = lambda x: x.float().cpu() # the metric functions want float32 [N, D] tensors on the cpu
+        _, test_target_2 = testset.sample(n_samples=N)         
+        results = []
+        for m, spec in enumerate(testset.specs):
+            g, t, t2 = as_float(generated_target[m]), as_float(test_target[m]), as_float(test_target_2[m])
+            results.append({
+                "number_of_training_measures" : self.dataset.n_measures,
+                "training_centers": self.dataset.centers,
+                "test center": spec.center,
+                "W1": float(was_1(g, t)),
+                "energy": float(energy_distance(g, t)),
+                "W1_floor": float(was_1(t2, t)),
+                "energy_floor": float(energy_distance(t2, t)),
+            })
+        return results
+
