@@ -14,6 +14,10 @@ For ALL loss funcs:
         represents the source minibatch
 '''
 from torchcfm.optimal_transport import wasserstein
+import ot as pot
+from ot.backend import get_backend
+from sklearn.metrics.pairwise import rbf_kernel
+
 
 def was_1(x0, x1):
     '''
